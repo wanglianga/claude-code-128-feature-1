@@ -46,6 +46,14 @@ public class Settlement {
     @Column(nullable = false, precision = 12, scale = 2)
     private BigDecimal deliveryPenalty = BigDecimal.ZERO;
 
+    /** 取模缺陷退回：诊所承担的重取模费用（加收）。 */
+    @Column(nullable = false, precision = 12, scale = 2)
+    private BigDecimal impressionClinicShare = BigDecimal.ZERO;
+
+    /** 取模缺陷退回：技工所承担的重取模费用（从应付中扣减）。 */
+    @Column(nullable = false, precision = 12, scale = 2)
+    private BigDecimal impressionLabDeduction = BigDecimal.ZERO;
+
     /** 应付总额。 */
     @Column(nullable = false, precision = 12, scale = 2)
     private BigDecimal totalAmount = BigDecimal.ZERO;

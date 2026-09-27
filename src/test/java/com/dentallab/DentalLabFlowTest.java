@@ -421,6 +421,154 @@ class DentalLabFlowTest {
         assertMoney("375.00", s.get("totalAmount"));
     }
 
+    // ---------- 第三场景：取模缺陷退回 → 重取模 → 重算交付 → 三端同步 → 确认归档 ----------
+
+    @Test
+    @Order(10)
+    void impressionDefectReturnFlow() {
+        // 诊所下单（烤瓷冠，牙位 21/22，传统取模，预计试戴 10 天后）
+        Map<String, Object> body = new HashMap<>();
+        body.put("patientCode", "PAT-2026-0003");
+        body.put("prosthesisType", "PFM_CROWN");
+        body.put("impressionMethod", "TRADITIONAL");
+        body.put("toothPositions", List.of("21", "22"));
+        body.put("shade", "VITA A3");
+        body.put("expectedTryInDate", LocalDate.now().plusDays(10).toString());
+        body.put("difficulty", 1);
+        Map<String, Object> order = data(post(doctorToken, "/api/orders", body));
+        Long oid = toLong(order.get("id"));
+        Long itemA = toLong(list(order, "toothItems").get(0).get("id"));
+        Long itemB = toLong(list(order, "toothItems").get(1).get("id"));
+        data(post(receiverToken, "/api/orders/" + oid + "/accept", null));
+
+        // 牙位 21 先完成模型接收
+        data(post(receiverToken, "/api/orders/" + oid + "/items/" + itemA + "/stages",
+                stageBody("MODEL_RECEIVING", "模型接收", null, null, null)));
+
+        // 技工所发现牙位 22 边缘不清+气泡，退回必须上传缺陷照片：缺照片应被拒绝
+        ResponseEntity<Map> noPhoto = postRaw(receiverToken,
+                "/api/orders/" + oid + "/impression-returns",
+                Map.of("defectType", "BUBBLE", "description", "边缘气泡"));
+        assertEquals(HttpStatus.BAD_REQUEST, noPhoto.getStatusCode());
+        assertTrue(String.valueOf(Objects.requireNonNull(noPhoto.getBody()).get("error")).contains("照片"));
+
+        // 正式上报缺陷：延期 5 天、费用 100 双方共担（50/50）
+        Map<String, Object> ret = new HashMap<>();
+        ret.put("toothItemId", itemB);
+        ret.put("defectType", "MARGIN_UNCLEAR");
+        ret.put("defectPhotos", List.of("defect_22_edge_1.jpg", "defect_22_edge_2.jpg"));
+        ret.put("description", "牙位22模型边缘不清且颊侧有气泡");
+        ret.put("delayDays", 5);
+        ret.put("costResponsibility", "SHARED");
+        ret.put("costAmount", 100);
+        Map<String, Object> returned = data(post(receiverToken,
+                "/api/orders/" + oid + "/impression-returns", ret));
+        Long returnId = toLong(returned.get("id"));
+        assertEquals("PENDING_REIMPRESSION", returned.get("status"));
+        assertEquals("MARGIN_UNCLEAR", returned.get("defectType"));
+        assertMoney("50", returned.get("clinicShare"));
+        assertMoney("50", returned.get("labShare"));
+
+        // 订单与牙位进入退回态；旧模型继续排产被拦截
+        Map<String, Object> detail = data(get(doctorToken, "/api/orders/" + oid));
+        assertEquals("IMPRESSION_RETURNED", detail.get("status"));
+        Map<String, Object> toothB = list(detail, "toothItems").stream()
+                .filter(t -> "22".equals(t.get("toothPosition"))).findFirst().orElseThrow();
+        assertEquals("IMPRESSION_RETURNED", toothB.get("status"));
+        ResponseEntity<Map> blocked = postRaw(tech1Token,
+                "/api/orders/" + oid + "/items/" + itemB + "/stages",
+                stageBody("SCAN_DESIGN", "旧模型继续排产", null, null, null));
+        assertEquals(HttpStatus.BAD_REQUEST, blocked.getStatusCode());
+        assertTrue(String.valueOf(Objects.requireNonNull(blocked.getBody()).get("error")).contains("旧模型"));
+
+        // 诊所端收到重取模通知
+        List<Map<String, Object>> notices = list(data(get(doctorToken,
+                "/api/orders/" + oid + "/notifications")), "$data");
+        assertEquals(1, notices.size());
+        assertEquals("CLINIC", notices.get(0).get("recipientType"));
+
+        // 技工所角色不能替诊所提交重取模
+        ResponseEntity<Map> forbidden = postRaw(receiverToken,
+                "/api/impression-returns/" + returnId + "/reimpression",
+                Map.of("note", "新模型已寄出"));
+        assertEquals(HttpStatus.FORBIDDEN, forbidden.getStatusCode());
+
+        // 诊所重新取模 → 服务重算交付日期（原日期+5天），患者/医生/诊所三端同步
+        Map<String, Object> reimpressed = data(post(clinicAdminToken,
+                "/api/impression-returns/" + returnId + "/reimpression",
+                Map.of("note", "已重新取模并顺丰寄出")));
+        assertEquals("REIMPRESSION_SUBMITTED", reimpressed.get("status"));
+        assertEquals(LocalDate.now().plusDays(15).toString(), reimpressed.get("newExpectedTryInDate"));
+        detail = data(get(doctorToken, "/api/orders/" + oid));
+        assertEquals(LocalDate.now().plusDays(15).toString(), detail.get("expectedTryInDate"));
+        assertEquals("ACCEPTED", detail.get("status"));
+        notices = list(data(get(doctorToken, "/api/orders/" + oid + "/notifications")), "$data");
+        assertEquals(4, notices.size());
+        assertEquals(List.of("CLINIC", "PATIENT", "DOCTOR", "CLINIC"),
+                notices.stream().map(n -> String.valueOf(n.get("recipientType"))).toList());
+        // 患者端提醒包含预约调整后的新日期
+        assertTrue(String.valueOf(notices.get(1).get("message")).contains(LocalDate.now().plusDays(15).toString()));
+
+        // 重复重取模被拒绝；医生未等诊所确认不能归档
+        ResponseEntity<Map> dup = postRaw(clinicAdminToken,
+                "/api/impression-returns/" + returnId + "/reimpression", Map.of());
+        assertEquals(HttpStatus.BAD_REQUEST, dup.getStatusCode());
+        ResponseEntity<Map> earlyArchive = postRaw(doctorToken,
+                "/api/impression-returns/" + returnId + "/doctor-archive", null);
+        assertEquals(HttpStatus.BAD_REQUEST, earlyArchive.getStatusCode());
+
+        // 诊所端确认 → 医生确认归档
+        Map<String, Object> confirmed = data(post(clinicAdminToken,
+                "/api/impression-returns/" + returnId + "/clinic-confirm", null));
+        assertEquals("CLINIC_CONFIRMED", confirmed.get("status"));
+        Map<String, Object> archived = data(post(doctorToken,
+                "/api/impression-returns/" + returnId + "/doctor-archive", null));
+        assertEquals("ARCHIVED", archived.get("status"));
+
+        // 新模型重新走八道工序（21 从扫描设计继续，22 从模型接收开始）
+        data(post(tech1Token, "/api/orders/" + oid + "/items/" + itemA + "/stages",
+                stageBody("SCAN_DESIGN", null, null, null, null)));
+        data(post(receiverToken, "/api/orders/" + oid + "/items/" + itemB + "/stages",
+                stageBody("MODEL_RECEIVING", "新模型接收", null, null, null)));
+        data(post(tech1Token, "/api/orders/" + oid + "/items/" + itemB + "/stages",
+                stageBody("SCAN_DESIGN", null, null, null, null)));
+        for (Long item : List.of(itemA, itemB)) {
+            data(post(doctorToken, "/api/orders/" + oid + "/items/" + item + "/confirm", null));
+            data(post(tech1Token, "/api/orders/" + oid + "/items/" + item + "/stages",
+                    stageBody("TEETH_ARRANGEMENT", null, null, null, null)));
+            data(post(tech2Token, "/api/orders/" + oid + "/items/" + item + "/stages",
+                    stageBody("SINTERING", null, null, null, null)));
+            data(post(tech1Token, "/api/orders/" + oid + "/items/" + item + "/stages",
+                    stageBody("POLISHING", null, null, null, null)));
+            data(post(qcToken, "/api/orders/" + oid + "/items/" + item + "/stages",
+                    stageBody("QC", null, null, null, null)));
+            data(post(receiverToken, "/api/orders/" + oid + "/items/" + item + "/stages",
+                    stageBody("DELIVERY", null, null, null, null)));
+        }
+
+        // 发货签收、两牙位试戴密合 → 订单完成
+        Map<String, Object> shipment = data(post(receiverToken,
+                "/api/orders/" + oid + "/shipments", null));
+        Long shipmentId = toLong(shipment.get("id"));
+        data(post(clinicAdminToken, "/api/shipments/" + shipmentId + "/sign",
+                Map.of("signResult", "GOOD", "signedByName", "陈前台")));
+        for (Long item : List.of(itemA, itemB)) {
+            Map<String, Object> fit = new HashMap<>();
+            fit.put("toothItemId", item);
+            fit.put("result", "FIT");
+            fit.put("experienceScore", 5);
+            data(post(doctorToken, "/api/orders/" + oid + "/try-ins", fit));
+        }
+        assertEquals("COMPLETED", data(get(doctorToken, "/api/orders/" + oid)).get("status"));
+
+        // 结算：基础费 300×2=600，重取模费用双方共担 100（诊所+50、技工所-50）→ 应付仍为 600
+        Map<String, Object> s = data(post(financeToken, "/api/orders/" + oid + "/settlement", null));
+        assertMoney("600.00", s.get("baseAmount"));
+        assertMoney("50.00", s.get("impressionClinicShare"));
+        assertMoney("50.00", s.get("impressionLabDeduction"));
+        assertMoney("600.00", s.get("totalAmount"));
+    }
+
     // ---------- 工具方法 ----------
 
     private String login(String username, String password) {

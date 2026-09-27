@@ -3,6 +3,7 @@ package com.dentallab.model;
 /** 单个牙位的流转状态。 */
 public enum ToothItemStatus {
     PENDING("待接收"),
+    IMPRESSION_RETURNED("取模缺陷退回"),
     DESIGNING("扫描设计中"),
     WAITING_CONFIRM("待医生确认"),
     CONFIRMED("医生已确认"),

@@ -66,6 +66,10 @@ public class ProductionService {
         ToothItem item = getItem(orderId, itemId);
         DentureOrder order = item.getOrder();
         ensureOrderInProduction(operator, order);
+        if (item.getStatus() == ToothItemStatus.IMPRESSION_RETURNED) {
+            throw new BizException("牙位 " + item.getToothPosition()
+                    + " 取模缺陷退回中，等待诊所重新取模，旧模型不得继续排产");
+        }
 
         if (stage == StageType.DOCTOR_CONFIRM) {
             throw new BizException("医生确认请由诊所医生调用确认接口 /confirm");
@@ -262,13 +266,19 @@ public class ProductionService {
     }
 
     private void refreshOrderStatus(DentureOrder order) {
+        OrderStatus current = order.getStatus();
+        if (current == OrderStatus.IMPRESSION_RETURNED) {
+            // 取模缺陷退回期间不自动变更订单状态，待诊所重新取模后由退回流程恢复
+            order.setUpdatedAt(LocalDateTime.now());
+            orderRepo.save(order);
+            return;
+        }
         List<ToothItem> items = itemRepo.findByOrderIdOrderByIdAsc(order.getId());
         boolean anyStarted = items.stream().anyMatch(i -> i.getCurrentStage() != null);
         boolean allQcPassed = items.stream().allMatch(i ->
                 EnumSet.of(ToothItemStatus.QC_PASSED, ToothItemStatus.READY_TO_SHIP,
                         ToothItemStatus.SHIPPED, ToothItemStatus.DELIVERED,
                         ToothItemStatus.TRY_IN_OK).contains(i.getStatus()));
-        OrderStatus current = order.getStatus();
         if (allQcPassed && !items.isEmpty()
                 && current != OrderStatus.QC_PASSED && current != OrderStatus.SHIPPED
                 && current != OrderStatus.DELIVERED && current != OrderStatus.TRY_IN

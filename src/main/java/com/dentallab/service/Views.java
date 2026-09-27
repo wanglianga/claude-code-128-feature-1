@@ -237,9 +237,56 @@ public final class Views {
         m.put("reworkClinicShare", s.getReworkClinicShare());
         m.put("reworkLabDeduction", s.getReworkLabDeduction());
         m.put("deliveryPenalty", s.getDeliveryPenalty());
+        m.put("impressionClinicShare", s.getImpressionClinicShare());
+        m.put("impressionLabDeduction", s.getImpressionLabDeduction());
         m.put("totalAmount", s.getTotalAmount());
         m.put("detail", s.getDetail());
         m.put("generatedAt", s.getGeneratedAt());
+        return m;
+    }
+
+    public static Map<String, Object> impressionReturn(ImpressionReturn r) {
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("id", r.getId());
+        m.put("orderId", r.getOrder().getId());
+        m.put("orderNo", r.getOrder().getOrderNo());
+        m.put("toothItemId", r.getToothItem() == null ? null : r.getToothItem().getId());
+        m.put("toothPosition", r.getToothItem() == null ? null : r.getToothItem().getToothPosition());
+        m.put("defectType", r.getDefectType().name());
+        m.put("defectTypeLabel", r.getDefectType().getLabel());
+        m.put("defectPhotos", r.getDefectPhotos());
+        m.put("description", r.getDescription());
+        m.put("reportedBy", r.getReportedBy().getDisplayName());
+        m.put("status", r.getStatus().name());
+        m.put("statusLabel", r.getStatus().getLabel());
+        m.put("delayDays", r.getDelayDays());
+        m.put("costResponsibility", r.getCostResponsibility().name());
+        m.put("costResponsibilityLabel", r.getCostResponsibility().getLabel());
+        m.put("costAmount", r.getCostAmount());
+        m.put("clinicShare", r.getClinicShare());
+        m.put("labShare", r.getLabShare());
+        m.put("oldExpectedTryInDate", r.getOldExpectedTryInDate());
+        m.put("newExpectedTryInDate", r.getNewExpectedTryInDate());
+        m.put("reimpressionNote", r.getReimpressionNote());
+        m.put("reimpressionAt", r.getReimpressionAt());
+        m.put("clinicConfirmedBy", r.getClinicConfirmedBy() == null ? null : r.getClinicConfirmedBy().getDisplayName());
+        m.put("clinicConfirmedAt", r.getClinicConfirmedAt());
+        m.put("doctorArchivedBy", r.getDoctorArchivedBy() == null ? null : r.getDoctorArchivedBy().getDisplayName());
+        m.put("doctorArchivedAt", r.getDoctorArchivedAt());
+        m.put("createdAt", r.getCreatedAt());
+        return m;
+    }
+
+    public static Map<String, Object> notification(Notification n) {
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("id", n.getId());
+        m.put("orderId", n.getOrder().getId());
+        m.put("orderNo", n.getOrder().getOrderNo());
+        m.put("impressionReturnId", n.getImpressionReturn() == null ? null : n.getImpressionReturn().getId());
+        m.put("recipientType", n.getRecipientType().name());
+        m.put("recipientTypeLabel", n.getRecipientType().getLabel());
+        m.put("message", n.getMessage());
+        m.put("createdAt", n.getCreatedAt());
         return m;
     }
 

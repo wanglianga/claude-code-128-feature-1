@@ -5,6 +5,7 @@ public enum OrderStatus {
     SUBMITTED("已提交"),
     ACCEPTED("技工所已接单"),
     IN_PRODUCTION("生产中"),
+    IMPRESSION_RETURNED("取模缺陷退回中"),
     QC_PASSED("质检通过"),
     SHIPPED("已发货"),
     DELIVERED("已签收"),

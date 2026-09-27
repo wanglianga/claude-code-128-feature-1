@@ -12,8 +12,9 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * 结算：按订单难度、返工责任、加急费用与签收结果生成。
- * 应付 = 基础费×难度系数 + 加急费 + 诊所承担返工费 − 技工所承担返工费 − 配送扣罚。
+ * 结算：按订单难度、返工责任、取模退回费用、加急费用与签收结果生成。
+ * 应付 = 基础费×难度系数 + 加急费 + 诊所承担返工费 + 诊所承担重取模费
+ * − 技工所承担返工费 − 技工所承担重取模费 − 配送扣罚。
  */
 @Service
 public class SettlementService {
@@ -27,17 +28,20 @@ public class SettlementService {
     private final ReworkRecordRepo reworkRepo;
     private final ShipmentRepo shipmentRepo;
     private final PriceConfigRepo priceConfigRepo;
+    private final ImpressionReturnRepo impressionReturnRepo;
     private final AuthService authService;
 
     public SettlementService(SettlementRepo settlementRepo, DentureOrderRepo orderRepo, ToothItemRepo itemRepo,
                              ReworkRecordRepo reworkRepo, ShipmentRepo shipmentRepo,
-                             PriceConfigRepo priceConfigRepo, AuthService authService) {
+                             PriceConfigRepo priceConfigRepo, ImpressionReturnRepo impressionReturnRepo,
+                             AuthService authService) {
         this.settlementRepo = settlementRepo;
         this.orderRepo = orderRepo;
         this.itemRepo = itemRepo;
         this.reworkRepo = reworkRepo;
         this.shipmentRepo = shipmentRepo;
         this.priceConfigRepo = priceConfigRepo;
+        this.impressionReturnRepo = impressionReturnRepo;
         this.authService = authService;
     }
 
@@ -75,6 +79,13 @@ public class SettlementService {
         BigDecimal labShare = reworks.stream().map(ReworkRecord::getLabShare)
                 .reduce(BigDecimal.ZERO, BigDecimal::add);
 
+        // 取模缺陷退回的重取模费用责任：诊所承担加收、技工所承担扣减
+        List<ImpressionReturn> impressionReturns = impressionReturnRepo.findByOrderIdOrderByIdAsc(orderId);
+        BigDecimal impressionClinicShare = impressionReturns.stream().map(ImpressionReturn::getClinicShare)
+                .reduce(BigDecimal.ZERO, BigDecimal::add);
+        BigDecimal impressionLabDeduction = impressionReturns.stream().map(ImpressionReturn::getLabShare)
+                .reduce(BigDecimal.ZERO, BigDecimal::add);
+
         BigDecimal deliveryPenalty = BigDecimal.ZERO;
         StringBuilder penaltyNote = new StringBuilder();
         for (Shipment shipment : shipmentRepo.findByOrderIdOrderByIdDesc(orderId)) {
@@ -90,7 +101,8 @@ public class SettlementService {
         }
 
         BigDecimal total = difficultyAmount.add(rushFee).add(clinicShare)
-                .subtract(labShare).subtract(deliveryPenalty);
+                .add(impressionClinicShare)
+                .subtract(labShare).subtract(impressionLabDeduction).subtract(deliveryPenalty);
         if (total.signum() < 0) {
             total = BigDecimal.ZERO;
         }
@@ -103,11 +115,14 @@ public class SettlementService {
         settlement.setReworkClinicShare(clinicShare);
         settlement.setReworkLabDeduction(labShare);
         settlement.setDeliveryPenalty(deliveryPenalty);
+        settlement.setImpressionClinicShare(impressionClinicShare);
+        settlement.setImpressionLabDeduction(impressionLabDeduction);
         settlement.setTotalAmount(total);
         settlement.setDetail(String.format(
-                "基础费=%s×%d牙位=%s; 难度系数=%s(难度%d); 加急费=%s; 诊所承担返工=%s; 技工所承担返工(扣减)=%s; 配送扣罚=%s%s; 应付=%s",
+                "基础费=%s×%d牙位=%s; 难度系数=%s(难度%d); 加急费=%s; 诊所承担返工=%s; 技工所承担返工(扣减)=%s; "
+                        + "重取模诊所承担=%s; 重取模技工所承担(扣减)=%s; 配送扣罚=%s%s; 应付=%s",
                 price.getBasePrice(), toothCount, base, multiplier, order.getDifficulty(),
-                rushFee, clinicShare, labShare, deliveryPenalty,
+                rushFee, clinicShare, labShare, impressionClinicShare, impressionLabDeduction, deliveryPenalty,
                 penaltyNote.length() == 0 ? "" : "(" + penaltyNote + ")", total));
         settlementRepo.save(settlement);
         return Views.settlement(settlement);

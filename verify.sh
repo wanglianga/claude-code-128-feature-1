@@ -167,6 +167,49 @@ checkMoney "加急费(300×0.3)" "$(echo "$SETTLE2" | jq -r '.data.rushFee')" "9
 checkMoney "延误扣罚(300×0.05)" "$(echo "$SETTLE2" | jq -r '.data.deliveryPenalty')" "15"
 checkMoney "加急单应付(300+90-15)" "$(echo "$SETTLE2" | jq -r '.data.totalAmount')" "375"
 
+say "11. 取模缺陷退回：缺陷照片→重取模→重算交付→三端同步→确认归档→结算"
+ORDER3=$(req POST /api/orders "$DOCTOR" '{"patientCode":"PAT-VERIFY-003","prosthesisType":"PFM_CROWN","impressionMethod":"TRADITIONAL","toothPositions":["21","22"],"shade":"VITA A3","expectedTryInDate":"2026-10-20","difficulty":1}')
+OID3=$(echo "$ORDER3" | jq -r '.data.id')
+ITM_A=$(echo "$ORDER3" | jq -r '.data.toothItems[0].id')
+ITM_B=$(echo "$ORDER3" | jq -r '.data.toothItems[1].id')
+req POST "/api/orders/$OID3/accept" "$RECEIVER" > /dev/null
+stage3() { req POST "/api/orders/$OID3/items/$1/stages" "$2" "{\"stage\":\"$3\",\"finish\":true}" > /dev/null; }
+stage3 "$ITM_A" "$RECEIVER" MODEL_RECEIVING
+check "缺照片上报被拒" "$(req POST "/api/orders/$OID3/impression-returns" "$RECEIVER" '{"defectType":"BUBBLE","description":"边缘气泡"}' | jq -r '.success')" "false"
+RET=$(req POST "/api/orders/$OID3/impression-returns" "$RECEIVER" "{\"toothItemId\":$ITM_B,\"defectType\":\"MARGIN_UNCLEAR\",\"defectPhotos\":[\"defect_1.jpg\",\"defect_2.jpg\"],\"description\":\"牙位22边缘不清且有气泡\",\"delayDays\":5,\"costResponsibility\":\"SHARED\",\"costAmount\":100}")
+RET_ID=$(echo "$RET" | jq -r '.data.id')
+check "缺陷退回单创建" "$(echo "$RET" | jq -r '.data.status')" "PENDING_REIMPRESSION"
+checkMoney "重取模费用诊所分摊(100共担)" "$(echo "$RET" | jq -r '.data.clinicShare')" "50"
+check "订单进入退回态" "$(req GET "/api/orders/$OID3" "$DOCTOR" | jq -r '.data.status')" "IMPRESSION_RETURNED"
+check "牙位22退回态" "$(req GET "/api/orders/$OID3" "$DOCTOR" | jq -r '[.data.toothItems[] | select(.toothPosition=="22") | .status][0]')" "IMPRESSION_RETURNED"
+check "旧模型排产被拦截" "$(req POST "/api/orders/$OID3/items/$ITM_B/stages" "$TECH1" '{"stage":"SCAN_DESIGN","finish":true}' | jq -r '.error' | grep -c '旧模型')" "1"
+check "诊所收到重取模通知" "$(req GET "/api/orders/$OID3/notifications" "$DOCTOR" | jq -r '[.data[] | select(.recipientType=="CLINIC")] | length')" "1"
+REIM=$(req POST "/api/impression-returns/$RET_ID/reimpression" "$CADMIN" '{"note":"已重新取模并寄出"}')
+check "重取模提交" "$(echo "$REIM" | jq -r '.data.status')" "REIMPRESSION_SUBMITTED"
+check "交付日期重算(10-20+5天)" "$(req GET "/api/orders/$OID3" "$DOCTOR" | jq -r '.data.expectedTryInDate')" "2026-10-25"
+check "三端同步通知(诊所+患者+医生+诊所)" "$(req GET "/api/orders/$OID3/notifications" "$DOCTOR" | jq -r '.data | length')" "4"
+check "患者端提醒含新日期" "$(req GET "/api/orders/$OID3/notifications" "$DOCTOR" | jq -r '[.data[] | select(.recipientType=="PATIENT") | .message][0]' | grep -c '2026-10-25')" "1"
+check "诊所端确认" "$(req POST "/api/impression-returns/$RET_ID/clinic-confirm" "$CADMIN" '' | jq -r '.data.status')" "CLINIC_CONFIRMED"
+check "医生确认归档" "$(req POST "/api/impression-returns/$RET_ID/doctor-archive" "$DOCTOR" '' | jq -r '.data.status')" "ARCHIVED"
+stage3 "$ITM_A" "$TECH1" SCAN_DESIGN
+stage3 "$ITM_B" "$RECEIVER" MODEL_RECEIVING
+stage3 "$ITM_B" "$TECH1" SCAN_DESIGN
+for ITEM in $ITM_A $ITM_B; do
+  req POST "/api/orders/$OID3/items/$ITEM/confirm" "$DOCTOR" > /dev/null
+  stage3 "$ITEM" "$TECH1" TEETH_ARRANGEMENT; stage3 "$ITEM" "$TECH2" SINTERING
+  stage3 "$ITEM" "$TECH1" POLISHING; stage3 "$ITEM" "$QC" QC; stage3 "$ITEM" "$RECEIVER" DELIVERY
+done
+SHIP4=$(req POST "/api/orders/$OID3/shipments" "$RECEIVER" '')
+SHIP4_ID=$(echo "$SHIP4" | jq -r '.data.id')
+req POST "/api/shipments/$SHIP4_ID/sign" "$CADMIN" '{"signResult":"GOOD","signedByName":"陈前台"}' > /dev/null
+req POST "/api/orders/$OID3/try-ins" "$DOCTOR" "{\"toothItemId\":$ITM_A,\"result\":\"FIT\",\"experienceScore\":5}" > /dev/null
+req POST "/api/orders/$OID3/try-ins" "$DOCTOR" "{\"toothItemId\":$ITM_B,\"result\":\"FIT\",\"experienceScore\":5}" > /dev/null
+check "退回后订单完成" "$(req GET "/api/orders/$OID3" "$DOCTOR" | jq -r '.data.status')" "COMPLETED"
+SETTLE3=$(req POST "/api/orders/$OID3/settlement" "$FINANCE" '')
+checkMoney "重取模诊所承担" "$(echo "$SETTLE3" | jq -r '.data.impressionClinicShare')" "50"
+checkMoney "重取模技工所扣减" "$(echo "$SETTLE3" | jq -r '.data.impressionLabDeduction')" "50"
+checkMoney "退回单应付(600+50-50)" "$(echo "$SETTLE3" | jq -r '.data.totalAmount')" "600"
+
 echo ""
 echo "==============================================="
 echo -e "验证结果: \033[1;32m通过 $PASS\033[0m 项, \033[1;31m失败 $FAIL\033[0m 项"
