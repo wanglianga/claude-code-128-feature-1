@@ -22,12 +22,15 @@ public class OrderService {
     private final ShipmentRepo shipmentRepo;
     private final TryInRecordRepo tryInRepo;
     private final SettlementRepo settlementRepo;
+    private final ImpressionReturnRepo impressionReturnRepo;
+    private final NoticeRepo noticeRepo;
     private final AuthService authService;
 
     public OrderService(DentureOrderRepo orderRepo, ToothItemRepo itemRepo, ScanFileRepo scanFileRepo,
                         OrderExceptionRepo exceptionRepo, ReworkRecordRepo reworkRepo,
                         ShipmentRepo shipmentRepo, TryInRecordRepo tryInRepo,
-                        SettlementRepo settlementRepo, AuthService authService) {
+                        SettlementRepo settlementRepo, ImpressionReturnRepo impressionReturnRepo,
+                        NoticeRepo noticeRepo, AuthService authService) {
         this.orderRepo = orderRepo;
         this.itemRepo = itemRepo;
         this.scanFileRepo = scanFileRepo;
@@ -36,6 +39,8 @@ public class OrderService {
         this.shipmentRepo = shipmentRepo;
         this.tryInRepo = tryInRepo;
         this.settlementRepo = settlementRepo;
+        this.impressionReturnRepo = impressionReturnRepo;
+        this.noticeRepo = noticeRepo;
         this.authService = authService;
     }
 
@@ -158,6 +163,10 @@ public class OrderService {
                 .map(Views::shipment).collect(Collectors.toList()));
         m.put("tryIns", tryInRepo.findByOrderIdOrderByIdAsc(orderId).stream()
                 .map(Views::tryIn).collect(Collectors.toList()));
+        m.put("impressionReturns", impressionReturnRepo.findByOrderIdOrderByIdAsc(orderId).stream()
+                .map(Views::impressionReturn).collect(Collectors.toList()));
+        m.put("notices", noticeRepo.findByOrderIdOrderByIdAsc(orderId).stream()
+                .map(Views::notice).collect(Collectors.toList()));
         settlementRepo.findByOrderId(orderId).ifPresent(s -> m.put("settlement", Views.settlement(s)));
         return m;
     }

@@ -19,7 +19,8 @@ import static org.junit.jupiter.api.Assertions.*;
 
 /**
  * 端到端流程测试（真实 PostgreSQL，dentallab_test 库）：
- * 下单→接单→八道工序→发货→签收→试戴→返工→责任判定→重做→再签收→结算→月结复核。
+ * 下单→接单→八道工序→发货→签收→试戴→返工→责任判定→重做→再签收→结算→月结复核；
+ * 加急+配送延误；取模缺陷退回（缺陷照片→诊所重取→重算交付日期→各端同步→诊所确认→医生归档→费用责任结算）。
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
@@ -419,6 +420,140 @@ class DentalLabFlowTest {
         assertMoney("90.00", s.get("rushFee"));
         assertMoney("15.00", s.get("deliveryPenalty"));
         assertMoney("375.00", s.get("totalAmount"));
+    }
+
+    // ---------- 第三场景：取模缺陷退回 ----------
+
+    @Test
+    @Order(10)
+    void impressionDefectReturnFlow() {
+        // 诊所下单（烤瓷冠，牙位 21，预计试戴 3 天后）
+        Map<String, Object> body = new HashMap<>();
+        body.put("patientCode", "PAT-2026-0003");
+        body.put("prosthesisType", "PFM_CROWN");
+        body.put("impressionMethod", "TRADITIONAL");
+        body.put("toothPositions", List.of("21"));
+        body.put("shade", "VITA A3");
+        body.put("expectedTryInDate", LocalDate.now().plusDays(3).toString());
+        body.put("difficulty", 1);
+        Map<String, Object> order = data(post(doctorToken, "/api/orders", body));
+        Long oid = toLong(order.get("id"));
+        Long item = toLong(list(order, "toothItems").get(0).get("id"));
+
+        // 技工所接单并完成模型接收
+        data(post(receiverToken, "/api/orders/" + oid + "/accept", null));
+        data(post(receiverToken, "/api/orders/" + oid + "/items/" + item + "/stages",
+                stageBody("MODEL_RECEIVING", "收到模型", null, null, null)));
+
+        // 未上传缺陷照片 → 拒绝（服务要求上传缺陷照片）
+        ResponseEntity<Map> noPhotos = postRaw(receiverToken, "/api/orders/" + oid + "/impression-returns",
+                Map.of("defectType", "MARGIN_UNCLEAR", "toothItemId", item, "description", "边缘不清"));
+        assertEquals(HttpStatus.BAD_REQUEST, noPhotos.getStatusCode());
+
+        // 上传缺陷照片 → 退回单创建，自动登记异常并通知诊所重取模
+        Map<String, Object> ret = data(post(receiverToken, "/api/orders/" + oid + "/impression-returns",
+                Map.of("defectType", "MARGIN_UNCLEAR", "toothItemId", item,
+                        "defectPhotos", List.of("defect_margin_1.jpg", "defect_margin_2.jpg"),
+                        "description", "21 近中边缘不清，需重新取模")));
+        Long returnId = toLong(ret.get("id"));
+        assertEquals("REPORTED", ret.get("status"));
+        assertEquals("PENDING", ret.get("responsibility"));
+
+        // 订单详情：异常事件 + 退回单 + 诊所端重取模通知；牙位退出排产
+        Map<String, Object> detail = data(get(doctorToken, "/api/orders/" + oid));
+        assertTrue(list(detail, "exceptions").stream().anyMatch(e -> "IMPRESSION_DEFECT".equals(e.get("type"))));
+        assertEquals(1, list(detail, "impressionReturns").size());
+        assertTrue(list(detail, "notices").stream().anyMatch(n ->
+                "CLINIC".equals(n.get("audience")) && "REIMPRESSION_REQUEST".equals(n.get("type"))));
+        assertEquals("IMPRESSION_RETURNED", list(detail, "toothItems").get(0).get("status"));
+
+        // 技工所不得把旧模型继续排产
+        ResponseEntity<Map> blocked = postRaw(tech1Token, "/api/orders/" + oid + "/items/" + item + "/stages",
+                stageBody("SCAN_DESIGN", "旧模型设计", null, null, null));
+        assertEquals(HttpStatus.BAD_REQUEST, blocked.getStatusCode());
+        assertTrue(String.valueOf(Objects.requireNonNull(blocked.getBody()).get("error")).contains("排产"));
+
+        // 诊所重新取模 → 服务重算交付日期（今天+7），延期 4 天（原 3 天后）
+        Map<String, Object> reimpressed = data(post(doctorToken,
+                "/api/impression-returns/" + returnId + "/reimpress",
+                Map.of("note", "已重新取模，新模型快递 SF123456")));
+        assertEquals("REIMPRESSED", reimpressed.get("status"));
+        assertEquals(4, ((Number) reimpressed.get("delayDays")).intValue());
+        assertEquals(LocalDate.now().plusDays(7).toString(), reimpressed.get("newExpectedTryInDate"));
+
+        // 交付延期写入订单；患者端同步提醒 + 医生端同步新日期
+        Map<String, Object> afterRe = data(get(doctorToken, "/api/orders/" + oid));
+        assertEquals(LocalDate.now().plusDays(7).toString(), String.valueOf(afterRe.get("expectedTryInDate")));
+        List<Map<String, Object>> notices = list(afterRe, "notices");
+        assertTrue(notices.stream().anyMatch(n ->
+                "PATIENT".equals(n.get("audience")) && "APPOINTMENT_ADJUSTMENT".equals(n.get("type"))));
+        assertTrue(notices.stream().anyMatch(n ->
+                "DOCTOR".equals(n.get("audience")) && "DELIVERY_DATE_SYNC".equals(n.get("type"))));
+        // 患者端/医生端通知可按接收端查询
+        Map<String, Object> patientNotices = data(get(clinicAdminToken, "/api/notices?audience=PATIENT"));
+        assertTrue(list(patientNotices, "$data").stream()
+                .anyMatch(n -> returnId.equals(toLong(n.get("impressionReturnId")))));
+        Map<String, Object> doctorNotices = data(get(doctorToken, "/api/notices?audience=DOCTOR"));
+        assertTrue(list(doctorNotices, "$data").stream()
+                .anyMatch(n -> returnId.equals(toLong(n.get("impressionReturnId")))));
+
+        // 牙位回到待接收，技工所接收新模型重新排产（不再使用旧模型）
+        assertEquals("PENDING", list(afterRe, "toothItems").get(0).get("status"));
+        data(post(receiverToken, "/api/orders/" + oid + "/items/" + item + "/stages",
+                stageBody("MODEL_RECEIVING", "接收新模型", null, null, null)));
+
+        // 诊所端确认 → 医生确认归档 → 关联异常自动解决
+        Map<String, Object> clinicConfirmed = data(post(clinicAdminToken,
+                "/api/impression-returns/" + returnId + "/clinic-confirm", null));
+        assertEquals("CLINIC_CONFIRMED", clinicConfirmed.get("status"));
+        Map<String, Object> archived = data(post(doctorToken,
+                "/api/impression-returns/" + returnId + "/doctor-confirm", null));
+        assertEquals("ARCHIVED", archived.get("status"));
+        assertNotNull(archived.get("archivedAt"));
+        Map<String, Object> detailAfterArchive = data(get(doctorToken, "/api/orders/" + oid));
+        Map<String, Object> defectExc = list(detailAfterArchive, "exceptions").stream()
+                .filter(e -> "IMPRESSION_DEFECT".equals(e.get("type"))).findFirst().orElseThrow();
+        assertEquals("RESOLVED", defectExc.get("status"));
+
+        // 新模型继续生产 → 发货 → 完好签收 → 试戴密合 → 订单完成
+        data(post(tech1Token, "/api/orders/" + oid + "/items/" + item + "/stages",
+                stageBody("SCAN_DESIGN", "新模型设计", null, null, null)));
+        data(post(doctorToken, "/api/orders/" + oid + "/items/" + item + "/confirm", null));
+        data(post(tech1Token, "/api/orders/" + oid + "/items/" + item + "/stages",
+                stageBody("TEETH_ARRANGEMENT", null, null, null, null)));
+        data(post(tech2Token, "/api/orders/" + oid + "/items/" + item + "/stages",
+                stageBody("SINTERING", null, null, null, null)));
+        data(post(tech1Token, "/api/orders/" + oid + "/items/" + item + "/stages",
+                stageBody("POLISHING", null, null, null, null)));
+        data(post(qcToken, "/api/orders/" + oid + "/items/" + item + "/stages",
+                stageBody("QC", null, null, null, null)));
+        data(post(receiverToken, "/api/orders/" + oid + "/items/" + item + "/stages",
+                stageBody("DELIVERY", null, null, null, null)));
+        Map<String, Object> shipment = data(post(receiverToken, "/api/orders/" + oid + "/shipments", null));
+        Long shipmentId = toLong(shipment.get("id"));
+        data(post(clinicAdminToken, "/api/shipments/" + shipmentId + "/sign",
+                Map.of("signResult", "GOOD", "signedByName", "陈前台")));
+        Map<String, Object> fit = new HashMap<>();
+        fit.put("toothItemId", item);
+        fit.put("result", "FIT");
+        fit.put("experienceScore", 5);
+        data(post(doctorToken, "/api/orders/" + oid + "/try-ins", fit));
+        assertEquals("COMPLETED", data(get(doctorToken, "/api/orders/" + oid)).get("status"));
+
+        // 取模退回费用责任未判定 → 结算拦截
+        ResponseEntity<Map> settleBlocked = postRaw(financeToken, "/api/orders/" + oid + "/settlement", null);
+        assertEquals(HttpStatus.BAD_REQUEST, settleBlocked.getStatusCode());
+        assertTrue(String.valueOf(Objects.requireNonNull(settleBlocked.getBody()).get("error"))
+                .contains("取模退回费用责任"));
+
+        // 判定诊所承担重取模费用 80 → 结算：基础 300 + 取模退回 80 = 380
+        data(post(labAdminToken, "/api/impression-returns/" + returnId + "/assign-responsibility",
+                Map.of("responsibility", "CLINIC", "cost", 80)));
+        Map<String, Object> s = data(post(financeToken, "/api/orders/" + oid + "/settlement", null));
+        assertMoney("300.00", s.get("baseAmount"));
+        assertMoney("80.00", s.get("impressionClinicShare"));
+        assertMoney("0.00", s.get("impressionLabDeduction"));
+        assertMoney("380.00", s.get("totalAmount"));
     }
 
     // ---------- 工具方法 ----------

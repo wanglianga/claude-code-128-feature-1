@@ -16,7 +16,8 @@ public enum ToothItemStatus {
     DELIVERED("已签收"),
     TRY_IN_OK("试戴密合"),
     TRY_IN_MISFIT("试戴不密合"),
-    REWORKING("返工中");
+    REWORKING("返工中"),
+    IMPRESSION_RETURNED("取模缺陷退回待重取");
 
     private final String label;
 

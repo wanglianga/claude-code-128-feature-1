@@ -35,13 +35,14 @@ public class ProductionService {
     private final ReworkRecordRepo reworkRepo;
     private final ShipmentRepo shipmentRepo;
     private final TryInRecordRepo tryInRepo;
+    private final ImpressionReturnRepo impressionReturnRepo;
     private final AuthService authService;
 
     public ProductionService(DentureOrderRepo orderRepo, ToothItemRepo itemRepo, StageRecordRepo stageRepo,
                              MaterialBatchRepo batchRepo, DesignAnnotationRepo annotationRepo,
                              OrderExceptionRepo exceptionRepo, ReworkRecordRepo reworkRepo,
                              ShipmentRepo shipmentRepo, TryInRecordRepo tryInRepo,
-                             AuthService authService) {
+                             ImpressionReturnRepo impressionReturnRepo, AuthService authService) {
         this.orderRepo = orderRepo;
         this.itemRepo = itemRepo;
         this.stageRepo = stageRepo;
@@ -51,6 +52,7 @@ public class ProductionService {
         this.reworkRepo = reworkRepo;
         this.shipmentRepo = shipmentRepo;
         this.tryInRepo = tryInRepo;
+        this.impressionReturnRepo = impressionReturnRepo;
         this.authService = authService;
     }
 
@@ -66,6 +68,7 @@ public class ProductionService {
         ToothItem item = getItem(orderId, itemId);
         DentureOrder order = item.getOrder();
         ensureOrderInProduction(operator, order);
+        ensureNotImpressionReturned(item);
 
         if (stage == StageType.DOCTOR_CONFIRM) {
             throw new BizException("医生确认请由诊所医生调用确认接口 /confirm");
@@ -122,6 +125,7 @@ public class ProductionService {
                 && (doctor.getClinic() == null || !doctor.getClinic().getId().equals(order.getClinic().getId()))) {
             throw BizException.forbidden("只能由本诊所医生确认该订单设计");
         }
+        ensureNotImpressionReturned(item);
         checkStageSequence(item, StageType.DOCTOR_CONFIRM);
 
         StageRecord record = new StageRecord();
@@ -223,6 +227,17 @@ public class ProductionService {
         }
         if (EnumSet.of(OrderStatus.COMPLETED, OrderStatus.CANCELLED).contains(order.getStatus())) {
             throw new BizException("订单已结束，不能继续登记工序");
+        }
+    }
+
+    /** 取模缺陷退回待诊所重取期间，技工所不得把旧模型继续排产。 */
+    private void ensureNotImpressionReturned(ToothItem item) {
+        for (ImpressionReturn ret : impressionReturnRepo.findByOrderIdAndStatus(
+                item.getOrder().getId(), ImpressionReturnStatus.REPORTED)) {
+            if (ret.getToothItem() == null || ret.getToothItem().getId().equals(item.getId())) {
+                throw new BizException("牙位 " + item.getToothPosition() + " 取模缺陷退回中（退回单#"
+                        + ret.getId() + "），技工所不得将旧模型继续排产，待诊所重新取模");
+            }
         }
     }
 

@@ -10,7 +10,8 @@ public enum ExceptionType {
     RUSH_REQUEST("患者加急"),
     DELIVERY_DELAY("配送延误"),
     DELIVERY_DAMAGE("配送破损"),
-    REWORK_DISPUTE("返工责任不清");
+    REWORK_DISPUTE("返工责任不清"),
+    IMPRESSION_DEFECT("取模缺陷退回");
 
     private final String label;
 

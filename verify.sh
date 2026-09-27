@@ -167,6 +167,52 @@ checkMoney "加急费(300×0.3)" "$(echo "$SETTLE2" | jq -r '.data.rushFee')" "9
 checkMoney "延误扣罚(300×0.05)" "$(echo "$SETTLE2" | jq -r '.data.deliveryPenalty')" "15"
 checkMoney "加急单应付(300+90-15)" "$(echo "$SETTLE2" | jq -r '.data.totalAmount')" "375"
 
+say "11. 取模缺陷退回：缺陷照片→诊所重取→重算日期→各端同步→诊所确认→医生归档→费用责任"
+ORDER3=$(req POST /api/orders "$DOCTOR" "{\"patientCode\":\"PAT-VERIFY-003\",\"prosthesisType\":\"PFM_CROWN\",\"impressionMethod\":\"TRADITIONAL\",\"toothPositions\":[\"21\"],\"shade\":\"VITA A3\",\"expectedTryInDate\":\"$(date -d '+3 days' +%F)\",\"difficulty\":1}")
+OID3=$(echo "$ORDER3" | jq -r '.data.id')
+ITEM4=$(echo "$ORDER3" | jq -r '.data.toothItems[0].id')
+req POST "/api/orders/$OID3/accept" "$RECEIVER" > /dev/null
+req POST "/api/orders/$OID3/items/$ITEM4/stages" "$RECEIVER" '{"stage":"MODEL_RECEIVING","finish":true}' > /dev/null
+check "未传缺陷照片被拒" "$(req POST "/api/orders/$OID3/impression-returns" "$RECEIVER" "{\"defectType\":\"BUBBLE\",\"toothItemId\":$ITEM4}" | jq -r '.success')" "false"
+RET=$(req POST "/api/orders/$OID3/impression-returns" "$RECEIVER" "{\"defectType\":\"BUBBLE\",\"toothItemId\":$ITEM4,\"defectPhotos\":[\"bubble_1.jpg\",\"bubble_2.jpg\"],\"description\":\"21 切端气泡\"}")
+RET_ID=$(echo "$RET" | jq -r '.data.id')
+check "缺陷退回单创建" "$(echo "$RET" | jq -r '.data.status')" "REPORTED"
+check "自动登记取模缺陷异常" "$(req GET "/api/orders/$OID3/exceptions" "$DOCTOR" | jq -r '[.data[] | select(.type=="IMPRESSION_DEFECT")] | length')" "1"
+check "诊所端收到重取模通知" "$(req GET "/api/notices?audience=CLINIC&orderId=$OID3" "$CADMIN" | jq -r '[.data[] | select(.type=="REIMPRESSION_REQUEST")] | length')" "1"
+check "牙位退出排产" "$(req GET "/api/orders/$OID3" "$DOCTOR" | jq -r '.data.toothItems[0].status')" "IMPRESSION_RETURNED"
+check "旧模型继续排产被拒" "$(req POST "/api/orders/$OID3/items/$ITEM4/stages" "$TECH1" '{"stage":"SCAN_DESIGN","finish":true}' | jq -r '.error' | grep -c '排产')" "1"
+NEW_DATE=$(date -d '+7 days' +%F)
+REIM=$(req POST "/api/impression-returns/$RET_ID/reimpress" "$DOCTOR" '{"note":"已重新取模，快递 SF777"}')
+check "诊所重取后状态" "$(echo "$REIM" | jq -r '.data.status')" "REIMPRESSED"
+check "服务重算交付日期(今天+7)" "$(echo "$REIM" | jq -r '.data.newExpectedTryInDate')" "$NEW_DATE"
+check "交付延期天数(7-3=4)" "$(echo "$REIM" | jq -r '.data.delayDays')" "4"
+check "交付延期写入订单" "$(req GET "/api/orders/$OID3" "$DOCTOR" | jq -r '.data.expectedTryInDate')" "$NEW_DATE"
+check "患者端同步提醒" "$(req GET "/api/notices?audience=PATIENT&orderId=$OID3" "$CADMIN" | jq -r '[.data[] | select(.type=="APPOINTMENT_ADJUSTMENT")] | length')" "1"
+check "医生端同步新日期" "$(req GET "/api/notices?audience=DOCTOR&orderId=$OID3" "$DOCTOR" | jq -r '[.data[] | select(.type=="DELIVERY_DATE_SYNC")] | length')" "1"
+check "牙位待接收新模型" "$(req GET "/api/orders/$OID3" "$DOCTOR" | jq -r '.data.toothItems[0].status')" "PENDING"
+check "诊所端确认" "$(req POST "/api/impression-returns/$RET_ID/clinic-confirm" "$CADMIN" '' | jq -r '.data.status')" "CLINIC_CONFIRMED"
+check "医生确认归档" "$(req POST "/api/impression-returns/$RET_ID/doctor-confirm" "$DOCTOR" '' | jq -r '.data.status')" "ARCHIVED"
+check "归档后异常闭环" "$(req GET "/api/orders/$OID3/exceptions" "$DOCTOR" | jq -r '[.data[] | select(.type=="IMPRESSION_DEFECT")][0].status')" "RESOLVED"
+# 新模型重新排产走完全流程
+req POST "/api/orders/$OID3/items/$ITEM4/stages" "$RECEIVER" '{"stage":"MODEL_RECEIVING","finish":true}' > /dev/null
+req POST "/api/orders/$OID3/items/$ITEM4/stages" "$TECH1" '{"stage":"SCAN_DESIGN","finish":true}' > /dev/null
+req POST "/api/orders/$OID3/items/$ITEM4/confirm" "$DOCTOR" > /dev/null
+req POST "/api/orders/$OID3/items/$ITEM4/stages" "$TECH1" '{"stage":"TEETH_ARRANGEMENT","finish":true}' > /dev/null
+req POST "/api/orders/$OID3/items/$ITEM4/stages" "$TECH2" '{"stage":"SINTERING","finish":true}' > /dev/null
+req POST "/api/orders/$OID3/items/$ITEM4/stages" "$TECH1" '{"stage":"POLISHING","finish":true}' > /dev/null
+req POST "/api/orders/$OID3/items/$ITEM4/stages" "$QC" '{"stage":"QC","finish":true}' > /dev/null
+req POST "/api/orders/$OID3/items/$ITEM4/stages" "$RECEIVER" '{"stage":"DELIVERY","finish":true}' > /dev/null
+SHIP4=$(req POST "/api/orders/$OID3/shipments" "$RECEIVER" '')
+SHIP4_ID=$(echo "$SHIP4" | jq -r '.data.id')
+req POST "/api/shipments/$SHIP4_ID/sign" "$CADMIN" '{"signResult":"GOOD","signedByName":"陈前台"}' > /dev/null
+req POST "/api/orders/$OID3/try-ins" "$DOCTOR" "{\"toothItemId\":$ITEM4,\"result\":\"FIT\",\"experienceScore\":5}" > /dev/null
+check "重取后订单完成" "$(req GET "/api/orders/$OID3" "$DOCTOR" | jq -r '.data.status')" "COMPLETED"
+check "结算拦截(取模退回费用责任未判定)" "$(req POST "/api/orders/$OID3/settlement" "$FINANCE" '' | jq -r '.error' | grep -c '取模退回费用责任')" "1"
+req POST "/api/impression-returns/$RET_ID/assign-responsibility" "$LADMIN" '{"responsibility":"CLINIC","cost":80}' > /dev/null
+SETTLE3=$(req POST "/api/orders/$OID3/settlement" "$FINANCE" '')
+checkMoney "取模退回诊所承担费用" "$(echo "$SETTLE3" | jq -r '.data.impressionClinicShare')" "80"
+checkMoney "含取模退回应付(300+80)" "$(echo "$SETTLE3" | jq -r '.data.totalAmount')" "380"
+
 echo ""
 echo "==============================================="
 echo -e "验证结果: \033[1;32m通过 $PASS\033[0m 项, \033[1;31m失败 $FAIL\033[0m 项"
